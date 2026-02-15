@@ -8,7 +8,7 @@ import pyttsx3
 try:
     engine = pyttsx3.init()
     def speak(text):
-        print(f"SPEAKING: {text}")  # Debug print
+        print(f"SPEAKING: {text}")
         engine.say(text)
         engine.runAndWait()
 except Exception as e:
@@ -23,7 +23,8 @@ mp_draw = mp.solutions.drawing_utils
 
 pose = mp_pose.Pose(
     min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
+    min_tracking_confidence=0.5,
+    model_complexity=1
 )
 
 face_mesh = mp_face_mesh.FaceMesh(
@@ -40,26 +41,31 @@ if not cap.isOpened():
     print("Cannot open camera")
     exit()
 
-cap.set(cv.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv.CAP_PROP_FRAME_HEIGHT, 720)
 
 # Constants
-FACE_HEIGHT_CM = 20  # Average face height
+AVG_FACE_HEIGHT_CM = 20  # Average face height from chin to forehead
+AVG_EYE_TO_EYE_CM = 6.5  # Average distance between eyes
 
 # Storage
 calibration_ratio = None
+calibration_method = None
 current_height = 0
 height_announced = False
 measurements = []
 debug_info = []
+calibration_frames = []
+calibration_complete_time = None
+stage = "CALIBRATE"  # CALIBRATE or MEASURE
 
 print("\n" + "="*50)
 print("HEIGHT MEASUREMENT SYSTEM")
 print("="*50)
 print("\nINSTRUCTIONS:")
-print("1. First show your FACE close to camera")
-print("2. Then STEP BACK so full body is visible")
-print("3. Stand straight with feet visible")
+print("1. First CALIBRATION: Show your FACE close to camera")
+print("2. Then MEASUREMENT: STEP BACK so full body is visible")
+print("3. Stand straight with feet clearly visible")
 print("4. Press 'q' to quit\n")
 
 while True:
@@ -67,7 +73,7 @@ while True:
     if not success:
         break
     
-    # Flip image horizontally
+    # Flip image horizontally for mirror effect
     img = cv.flip(img, 1)
     h, w, _ = img.shape
     
@@ -83,64 +89,171 @@ while True:
     # Clear debug info each frame
     debug_info = []
     
-    # Draw pose if detected
-    if pose_results.pose_landmarks:
+    # ===== CALIBRATION PHASE =====
+    if stage == "CALIBRATE" and face_results.multi_face_landmarks:
+        for face_landmarks in face_results.multi_face_landmarks:
+            # Method 1: Face height calibration
+            y_coords = [lm.y * h for lm in face_landmarks.landmark]
+            face_h_px = max(y_coords) - min(y_coords)
+            
+            # Method 2: Eye distance calibration (more stable)
+            # Get left eye (indices 33, 133) and right eye (362, 263)
+            left_eye_indices = [33, 133]
+            right_eye_indices = [362, 263]
+            
+            left_eye_center = np.mean([(face_landmarks.landmark[i].x * w, 
+                                       face_landmarks.landmark[i].y * h) 
+                                      for i in left_eye_indices], axis=0)
+            right_eye_center = np.mean([(face_landmarks.landmark[i].x * w, 
+                                        face_landmarks.landmark[i].y * h) 
+                                       for i in right_eye_indices], axis=0)
+            
+            eye_distance_px = np.linalg.norm(left_eye_center - right_eye_center)
+            
+            if face_h_px > 30 and eye_distance_px > 10:
+                # Store multiple calibration frames for averaging
+                calibration_frames.append({
+                    'face_h': face_h_px,
+                    'eye_dist': eye_distance_px,
+                    'timestamp': time.time()
+                })
+                
+                # Keep last 10 frames
+                if len(calibration_frames) > 10:
+                    calibration_frames.pop(0)
+                
+                # Show calibration progress
+                cv.putText(img, f"Calibration frames: {len(calibration_frames)}/10", 
+                          (20, 200), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                # Draw face landmarks
+                mp_draw.draw_landmarks(img, face_landmarks, mp_face_mesh.FACEMESH_CONTOURS)
+                
+                # Draw eye distance
+                cv.line(img, tuple(left_eye_center.astype(int)), 
+                       tuple(right_eye_center.astype(int)), (0, 255, 0), 2)
+                
+                # After collecting enough frames, compute average calibration
+                if len(calibration_frames) >= 8 and calibration_complete_time is None:
+                    avg_face_h = np.mean([f['face_h'] for f in calibration_frames])
+                    avg_eye_dist = np.mean([f['eye_dist'] for f in calibration_frames])
+                    
+                    # Use both methods and average them
+                    ratio_face = AVG_FACE_HEIGHT_CM / avg_face_h
+                    ratio_eye = AVG_EYE_TO_EYE_CM / avg_eye_dist
+                    
+                    calibration_ratio = (ratio_face + ratio_eye) / 2
+                    calibration_complete_time = time.time()
+                    stage = "MEASURE"
+                    
+                    print(f"\n✓ CALIBRATION COMPLETE!")
+                    print(f"  Face height: {avg_face_h:.0f} pixels")
+                    print(f"  Eye distance: {avg_eye_dist:.0f} pixels")
+                    print(f"  Ratio: {calibration_ratio:.4f} cm/pixel")
+                    speak("Calibration complete. Now show your full body.")
+    
+    # ===== MEASUREMENT PHASE =====
+    if stage == "MEASURE" and pose_results.pose_landmarks:
+        # Draw pose landmarks
         mp_draw.draw_landmarks(
             img, 
             pose_results.pose_landmarks,
-            mp_pose.POSE_CONNECTIONS
+            mp_pose.POSE_CONNECTIONS,
+            mp_draw.DrawingSpec(color=(0,255,0), thickness=2, circle_radius=2),
+            mp_draw.DrawingSpec(color=(0,0,255), thickness=2)
         )
         
         # Get all landmarks
         landmarks = pose_results.pose_landmarks.landmark
         
-        # Get nose (top reference)
+        # TOP POINT: Use nose or top of head (index 0 for nose)
+        top_point = None
+        top_y = float('inf')
+        
+        # Check nose (most reliable)
         nose = landmarks[0]
-        nose_y = nose.y * h
-        debug_info.append(f"Nose visible: {nose.visibility:.2f}")
+        if nose.visibility > 0.7:
+            top_y = nose.y * h
+            top_point = (w//2, int(top_y))
+            debug_info.append(f"Nose visible: {nose.visibility:.2f}")
         
-        # Try multiple points for bottom detection (in order of preference)
-        bottom_points = []
+        # Also check eye and ear for better top estimation
+        left_eye = landmarks[2]  # Left eye
+        right_eye = landmarks[5]  # Right eye
+        left_ear = landmarks[7]   # Left ear
+        right_ear = landmarks[8]  # Right ear
         
-        # Try feet/ankles in order
+        if left_eye.visibility > 0.7:
+            top_y = min(top_y, left_eye.y * h)
+        if right_eye.visibility > 0.7:
+            top_y = min(top_y, right_eye.y * h)
+        if left_ear.visibility > 0.7:
+            top_y = min(top_y, left_ear.y * h)
+        if right_ear.visibility > 0.7:
+            top_y = min(top_y, right_ear.y * h)
+        
+        # BOTTOM POINT: Try multiple foot/ankle points
+        bottom_y = 0
+        bottom_point = None
+        foot_detected = False
+        
+        # Check feet and ankles
         foot_indices = [
-            (31, "Left Foot"),   # Left foot
-            (32, "Right Foot"),  # Right foot
-            (29, "Left Heel"),   # Left heel
-            (30, "Right Heel"),  # Right heel
+            (31, "Left Foot"),   # Left foot index
+            (32, "Right Foot"),  # Right foot index
             (27, "Left Ankle"),  # Left ankle
             (28, "Right Ankle"), # Right ankle
+            (29, "Left Heel"),   # Left heel
+            (30, "Right Heel"),  # Right heel
         ]
         
         for idx, name in foot_indices:
             if idx < len(landmarks):
                 point = landmarks[idx]
-                if point.visibility > 0.5:
-                    bottom_points.append((point.y * h, name))
-                    debug_info.append(f"{name}: {point.visibility:.2f}")
+                if point.visibility > 0.7:
+                    y_pos = point.y * h
+                    if y_pos > bottom_y:
+                        bottom_y = y_pos
+                        bottom_point = (w//2, int(y_pos))
+                        foot_detected = True
+                        debug_info.append(f"{name}: {point.visibility:.2f}")
         
-        # Also try using hip to estimate if feet not visible
-        if not bottom_points:
-            # Use hip points to estimate
+        # If feet not visible, try to estimate from hips
+        if not foot_detected:
             left_hip = landmarks[23]
             right_hip = landmarks[24]
-            if left_hip.visibility > 0.5 and right_hip.visibility > 0.5:
-                hip_y = (left_hip.y * h + right_hip.y * h) / 2
-                # Rough estimate: total height ≈ 2.3 × hip height
-                estimated_bottom = hip_y + (hip_y - nose_y) * 1.3
-                bottom_points.append((estimated_bottom, "Estimated from hips"))
-                debug_info.append("Using hip estimation")
-        
-        if bottom_points and nose.visibility > 0.5:
-            # Get the lowest point (closest to feet)
-            bottom_points.sort(reverse=True)  # Sort by y coordinate (largest = lowest)
-            lowest_y, point_name = bottom_points[0]
+            left_knee = landmarks[25]
+            right_knee = landmarks[26]
             
-            # Calculate height in pixels
-            height_px = lowest_y - nose_y
+            if (left_hip.visibility > 0.7 and right_hip.visibility > 0.7 and
+                left_knee.visibility > 0.7 and right_knee.visibility > 0.7):
+                
+                hip_y = (left_hip.y * h + right_hip.y * h) / 2
+                knee_y = (left_knee.y * h + right_knee.y * h) / 2
+                
+                # Estimate foot position: foot_y = knee_y + (knee_y - hip_y)
+                estimated_foot_y = knee_y + (knee_y - hip_y)
+                bottom_y = estimated_foot_y
+                bottom_point = (w//2, int(estimated_foot_y))
+                debug_info.append("Using estimated foot position")
+        
+        # Calculate height if we have both points
+        if top_point and bottom_point and bottom_y > top_y:
+            height_px = bottom_y - top_y
             debug_info.append(f"Height pixels: {height_px:.0f}")
             
-            # If we have calibration, convert to cm
+            # Draw measurement line (YELLOW LINE as in your photo)
+            cv.line(img, top_point, bottom_point, (0, 255, 255), 4)
+            cv.circle(img, top_point, 8, (0, 255, 0), -1)
+            cv.circle(img, bottom_point, 8, (0, 0, 255), -1)
+            
+            # Add labels
+            cv.putText(img, "TOP", (top_point[0] + 15, top_point[1] - 10),
+                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv.putText(img, "BOTTOM", (bottom_point[0] + 15, bottom_point[1] - 10),
+                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            
+            # Convert to cm
             if calibration_ratio is not None:
                 height_cm = height_px * calibration_ratio
                 debug_info.append(f"Raw height: {height_cm:.1f}cm")
@@ -150,82 +263,74 @@ while True:
                     measurements.append(height_cm)
                     debug_info.append(f"Valid! Added to measurements")
                     
-                    # Keep last 10 measurements
-                    if len(measurements) > 10:
+                    # Keep last 15 measurements
+                    if len(measurements) > 15:
                         measurements.pop(0)
                     
-                    # Calculate average
-                    if len(measurements) >= 3:
-                        current_height = sum(measurements) / len(measurements)
+                    # Calculate moving average
+                    if len(measurements) >= 5:
+                        # Remove outliers
+                        sorted_meas = sorted(measurements[-10:])
+                        if len(sorted_meas) > 3:
+                            trimmed = sorted_meas[1:-1]  # Remove highest and lowest
+                            current_height = sum(trimmed) / len(trimmed)
+                        else:
+                            current_height = sum(measurements) / len(measurements)
                         
-                        # Draw measurement line
-                        cv.line(img, (w//2, int(nose_y)), (w//2, int(lowest_y)), (0, 255, 255), 3)
-                        cv.circle(img, (w//2, int(nose_y)), 8, (0, 255, 0), -1)
-                        cv.circle(img, (w//2, int(lowest_y)), 8, (0, 0, 255), -1)
-                        
-                        # Add labels
-                        cv.putText(img, "Top", (w//2 + 10, int(nose_y) - 10),
-                                  cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                        cv.putText(img, f"Bottom ({point_name[:10]})", (w//2 + 10, int(lowest_y) - 10),
-                                  cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-                        
-                        # Announce height when stable
-                        if not height_announced and len(measurements) >= 8:
+                        # Announce when stable
+                        if not height_announced and len(measurements) >= 10:
                             speak(f"Your height is {current_height:.0f} centimeters")
                             height_announced = True
                             print(f"\n✓ HEIGHT ANNOUNCED: {current_height:.1f} cm")
-                else:
-                    debug_info.append(f"Invalid height: {height_cm:.1f}cm")
-    
-    # Face calibration
-    if face_results.multi_face_landmarks and calibration_ratio is None:
-        for face_landmarks in face_results.multi_face_landmarks:
-            # Get face height
-            y_coords = [lm.y * h for lm in face_landmarks.landmark]
-            face_h_px = max(y_coords) - min(y_coords)
-            
-            if face_h_px > 20:
-                calibration_ratio = FACE_HEIGHT_CM / face_h_px
-                print(f"\n✓ CALIBRATION COMPLETE!")
-                print(f"  Face height: {face_h_px:.0f} pixels")
-                print(f"  Ratio: {calibration_ratio:.4f} cm/pixel")
-                speak("Calibration complete. Now show your full body.")
     
     # ===== DISPLAY ON SCREEN =====
     
-    # Create semi-transparent background
+    # Create semi-transparent background for text
     overlay = img.copy()
-    cv.rectangle(overlay, (10, 10), (450, 350), (0, 0, 0), -1)
+    cv.rectangle(overlay, (10, 10), (500, 400), (0, 0, 0), -1)
     cv.addWeighted(overlay, 0.7, img, 0.3, 0, img)
     
     y_pos = 40
     
     # Title
-    cv.putText(img, "HEIGHT MEASUREMENT", (20, y_pos), 
+    cv.putText(img, "HEIGHT MEASUREMENT SYSTEM", (20, y_pos), 
               cv.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
     y_pos += 40
     
-    # Calibration status
-    if calibration_ratio is None:
-        cv.putText(img, "⏳ CALIBRATING... Show your face", (20, y_pos), 
-                  cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    # Stage indicator
+    if stage == "CALIBRATE":
+        cv.putText(img, "STAGE 1: CALIBRATION", (20, y_pos), 
+                  cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        y_pos += 35
+        cv.putText(img, "Show your face close to camera", (20, y_pos), 
+                  cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         y_pos += 30
+        
         if face_results.multi_face_landmarks:
             cv.putText(img, "✓ Face detected", (20, y_pos), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    else:
-        cv.putText(img, "✓ CALIBRATION COMPLETE", (20, y_pos), 
-                  cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        y_pos += 40
+                      cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            y_pos += 30
+            cv.putText(img, f"Calibration frames: {len(calibration_frames)}/10", (20, y_pos), 
+                      cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        else:
+            cv.putText(img, "⚠️ No face detected", (20, y_pos), 
+                      cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    
+    else:  # MEASURE stage
+        cv.putText(img, "STAGE 2: MEASUREMENT", (20, y_pos), 
+                  cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        y_pos += 35
+        cv.putText(img, "Step back - show full body", (20, y_pos), 
+                  cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        y_pos += 30
         
-        # Show height if available
         if current_height > 0:
-            # Height in large text
+            # Show height
             cv.putText(img, "YOUR HEIGHT:", (20, y_pos), 
                       cv.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             y_pos += 50
             
-            # Centimeters - LARGE
+            # Large height display
             cv.putText(img, f"{current_height:.1f} cm", (20, y_pos), 
                       cv.FONT_HERSHEY_SIMPLEX, 2.5, (0, 255, 255), 5)
             y_pos += 70
@@ -238,46 +343,31 @@ while True:
                       cv.FONT_HERSHEY_SIMPLEX, 1.8, (0, 255, 255), 4)
             y_pos += 50
             
-            # Measurements count
-            cv.putText(img, f"Readings: {len(measurements)}/10", (20, y_pos), 
+            # Progress
+            cv.putText(img, f"Readings: {len(measurements)}/15", (20, y_pos), 
                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
             y_pos += 25
             
-            # Announcement status
             if height_announced:
                 cv.putText(img, "✓ Height announced", (20, y_pos), 
                           cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
             else:
-                cv.putText(img, f"⏳ Stabilizing... {len(measurements)}/8", (20, y_pos), 
+                cv.putText(img, f"⏳ Stabilizing... {len(measurements)}/10", (20, y_pos), 
                           cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
         else:
-            cv.putText(img, "🟡 STEP BACK - SHOW FULL BODY", (20, y_pos), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-            y_pos += 35
-            cv.putText(img, "Make sure feet are visible", (20, y_pos), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-    
-    # Debug info
-    y_pos = h - 120
-    cv.putText(img, "DEBUG INFO:", (20, y_pos), 
-              cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-    y_pos += 20
-    for debug in debug_info[-5:]:  # Show last 5 debug messages
-        cv.putText(img, debug, (20, y_pos), 
-                  cv.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-        y_pos += 15
-    
-    # Detection status
-    if pose_results.pose_landmarks:
-        if 'bottom_points' in locals() and bottom_points:
-            cv.putText(img, "✓ FULL BODY DETECTED", (20, h-30), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        else:
-            cv.putText(img, "⚠️ FEET NOT VISIBLE - step back", (20, h-30), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-    else:
-        cv.putText(img, "⚠️ NO BODY DETECTED", (20, h-30), 
-                  cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv.putText(img, "⚠️ Waiting for body detection", (20, y_pos), 
+                      cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            y_pos += 30
+            if pose_results.pose_landmarks:
+                if foot_detected:
+                    cv.putText(img, "✓ Full body detected", (20, y_pos), 
+                              cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                else:
+                    cv.putText(img, "⚠️ Feet not visible - step back", (20, y_pos), 
+                              cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            else:
+                cv.putText(img, "⚠️ No body detected", (20, y_pos), 
+                          cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
     
     # Instructions
     cv.putText(img, "Press 'q' to quit", (w-150, 30), 
