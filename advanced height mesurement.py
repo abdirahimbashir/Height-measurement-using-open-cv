@@ -2,7 +2,7 @@ import cv2 as cv
 import mediapipe as mp
 import numpy as np
 import time
-import pyttsx3
+import pyttsx3. 
 
 # Initialize Text-to-Speech
 try:
