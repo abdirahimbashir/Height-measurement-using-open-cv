@@ -2,4 +2,4 @@ Python ==3.9.21
 opencv-python==4.9.0.80
 mediapipe==0.10.14
 numpy==1.26.4
-pyttsx3==2.90
+pyttsx3==2.90 
