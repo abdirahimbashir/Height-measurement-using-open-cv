@@ -25,4 +25,4 @@ python "advanced height mesurement.py"
 
 Notes:
 - Stand 1–2 meters from the camera and ensure good lighting during calibration.
-- Press `r` to reset calibration and `q` to quit.
+- - Press `r` to reset calibration and `q` to quit.
