@@ -1,5 +1,9 @@
 # Advanced Height Measurement
 
+![Image](https://github.com/user-attachments/assets/93b4be63-f3ec-401f-bec3-29d7b42db379)
+
+
+
 Small single-file Python script that uses OpenCV and MediaPipe to estimate a person's height from webcam video.
 
 Quick start (Windows):
